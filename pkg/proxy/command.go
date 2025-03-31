@@ -421,7 +421,10 @@ func ExtractCommandAction(ctx context.Context, command string, params RequestPar
 		if err != nil {
 			return nil, err
 		}
-		return func(v *vehicle.Vehicle) error { return v.SetValetMode(ctx, on, password) }, nil
+		if on {
+			return func(v *vehicle.Vehicle) error { return v.EnableValetMode(ctx, password) }, nil
+		}
+		return func(v *vehicle.Vehicle) error { return v.DisableValetMode(ctx) }, nil
 	case "set_vehicle_name":
 		name, err := params.getString("vehicle_name", true)
 		if err != nil {
@@ -492,7 +495,7 @@ func ExtractCommandAction(ctx context.Context, command string, params RequestPar
 			return nil, errors.New("command must be 'vent' or 'close'")
 		}
 	default:
-		return nil, &inet.HttpError{Code: http.StatusBadRequest, Message: "{\"response\":null,\"error\":\"invalid_command\",\"error_description\":\"\"}"}
+		return nil, &inet.HTTPError{Code: http.StatusBadRequest, Message: "{\"response\":null,\"error\":\"invalid_command\",\"error_description\":\"\"}"}
 	}
 }
 

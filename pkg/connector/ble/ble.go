@@ -5,6 +5,7 @@ package ble
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -86,8 +87,8 @@ func (c *Connection) flush() bool {
 }
 
 func (c *Connection) Close() {
-	c.client.ClearSubscriptions()
-	c.client.CancelConnection()
+	_ = c.client.ClearSubscriptions()
+	_ = c.client.CancelConnection()
 }
 
 func (c *Connection) AllowedLatency() time.Duration {
@@ -104,7 +105,7 @@ func (c *Connection) rx(p []byte) {
 	}
 }
 
-func (c *Connection) Send(ctx context.Context, buffer []byte) error {
+func (c *Connection) Send(_ context.Context, buffer []byte) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -129,14 +130,97 @@ func (c *Connection) VIN() string {
 	return c.vin
 }
 
+func VehicleLocalName(vin string) string {
+	vinBytes := []byte(vin)
+	digest := sha1.Sum(vinBytes)
+	return fmt.Sprintf("S%02xC", digest[:8])
+}
+
+func initDevice() error {
+	var err error
+	// We don't want concurrent calls to NewConnection that would defeat
+	// the point of reusing the existing BLE device. Note that this is not
+	// an issue on MacOS, but multiple calls to newDevice() on Linux leads to failures.
+	if device != nil {
+		log.Debug("Reusing existing BLE device")
+	} else {
+		log.Debug("Creating new BLE device")
+		device, err = newDevice()
+		if err != nil {
+			return fmt.Errorf("failed to find a BLE device: %s", err)
+		}
+		ble.SetDefaultDevice(device)
+	}
+	return nil
+}
+
+type Advertisement = ble.Advertisement
+
+func ScanVehicleBeacon(ctx context.Context, vin string) (Advertisement, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if err := initDevice(); err != nil {
+		return nil, err
+	}
+
+	a, err := scanVehicleBeacon(ctx, VehicleLocalName(vin))
+	if err != nil {
+		return nil, fmt.Errorf("ble: failed to scan for %s: %s", vin, err)
+	}
+	return a, nil
+}
+
+func scanVehicleBeacon(ctx context.Context, localName string) (Advertisement, error) {
+	var err error
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ch := make(chan Advertisement, 1)
+	fn := func(a Advertisement) {
+		if a.LocalName() != localName {
+			return
+		}
+		select {
+		case ch <- a:
+			cancel() // Notify device.Scan() that we found a match
+		case <-ctx2.Done():
+			// Another goroutine already found a matching advertisement. We need to return so that
+			// the MacOS implementation of device.Scan(...) unblocks.
+		}
+	}
+
+	if err = device.Scan(ctx2, false, fn); !errors.Is(err, context.Canceled) {
+		// If ctx rather than ctx2 was canceled, we'll pick that error up below. This is a bit
+		// hacky, but unfortunately device.Scan() _always_ returns an error on MacOS because it does
+		// not terminate until the provided context is canceled.
+		return nil, err
+	}
+
+	select {
+	case a, ok := <-ch:
+		if !ok {
+			// This should never happen, but just in case
+			return nil, fmt.Errorf("scan channel closed")
+		}
+		return a, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func NewConnection(ctx context.Context, vin string) (*Connection, error) {
+	return NewConnectionToBleTarget(ctx, vin, nil)
+}
+
+func NewConnectionToBleTarget(ctx context.Context, vin string, target Advertisement) (*Connection, error) {
 	var lastError error
 	for {
-		conn, err := tryToConnect(ctx, vin)
+		conn, retry, err := tryToConnect(ctx, vin, target)
 		if err == nil {
 			return conn, nil
 		}
-		if strings.Contains(err.Error(), "operation not permitted") {
+		if !retry || strings.Contains(err.Error(), "operation not permitted") {
 			return nil, err
 		}
 		log.Warning("BLE connection attempt failed: %s", err)
@@ -150,61 +234,51 @@ func NewConnection(ctx context.Context, vin string) (*Connection, error) {
 	}
 }
 
-func tryToConnect(ctx context.Context, vin string) (*Connection, error) {
+func tryToConnect(ctx context.Context, vin string, target Advertisement) (*Connection, bool, error) {
 	var err error
-	// We don't want concurrent calls to NewConnection that would defeat
-	// the point of reusing the existing BLE device. Note that this is not
-	// an issue on MacOS, but multiple calls to newDevice() on Linux leads to failures.
 	mu.Lock()
 	defer mu.Unlock()
 
-	if device != nil {
-		log.Debug("Reusing existing BLE device")
-	} else {
-		log.Debug("Creating new BLE device")
-		device, err = newDevice()
+	if err = initDevice(); err != nil {
+		return nil, false, err
+	}
+
+	localName := VehicleLocalName(vin)
+
+	if target == nil {
+		target, err = scanVehicleBeacon(ctx, localName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to find a BLE device: %s", err)
+			return nil, true, fmt.Errorf("ble: failed to scan for %s: %s", vin, err)
 		}
-		ble.SetDefaultDevice(device)
 	}
 
-	vinBytes := []byte(vin)
-	digest := sha1.Sum(vinBytes)
-
-	localName := fmt.Sprintf("S%02xC", digest[:8])
-	log.Debug("Searching for BLE beacon %s...", localName)
-	canConnect := false
-	filter := func(adv ble.Advertisement) bool {
-		ln := adv.LocalName()
-		if ln != localName {
-			return false
-		}
-		canConnect = adv.Connectable()
-		return true
+	if target.LocalName() != localName {
+		return nil, false, fmt.Errorf("ble: beacon with unexpected local name: '%s'", target.LocalName())
 	}
 
-	client, err := ble.Connect(ctx, filter)
+	if !target.Connectable() {
+		return nil, false, ErrMaxConnectionsExceeded
+	}
+
+	log.Debug("Dialing to %s (%s)...", target.Addr(), localName)
+
+	client, err := ble.Dial(ctx, target.Addr())
 	if err != nil {
-		return nil, fmt.Errorf("failed to find BLE beacon for %s (%s): %s", vin, localName, err)
+		return nil, true, fmt.Errorf("ble: failed to dial for %s (%s): %s", vin, localName, err)
 	}
 
-	if !canConnect {
-		return nil, ErrMaxConnectionsExceeded
-	}
-
-	log.Debug("Connecting to BLE beacon %s...", client.Addr())
+	log.Debug("Discovering services %s...", client.Addr())
 	services, err := client.DiscoverServices([]ble.UUID{vehicleServiceUUID})
 	if err != nil {
-		return nil, fmt.Errorf("ble: failed to enumerate device services: %s", err)
+		return nil, true, fmt.Errorf("ble: failed to enumerate device services: %s", err)
 	}
 	if len(services) == 0 {
-		return nil, fmt.Errorf("ble: failed to discover service")
+		return nil, true, fmt.Errorf("ble: failed to discover service")
 	}
 
 	characteristics, err := client.DiscoverCharacteristics([]ble.UUID{toVehicleUUID, fromVehicleUUID}, services[0])
 	if err != nil {
-		return nil, fmt.Errorf("ble: failed to discover service characteristics: %s", err)
+		return nil, true, fmt.Errorf("ble: failed to discover service characteristics: %s", err)
 	}
 
 	conn := Connection{
@@ -219,15 +293,15 @@ func tryToConnect(ctx context.Context, vin string) (*Connection, error) {
 			conn.rxChar = characteristic
 		}
 		if _, err := client.DiscoverDescriptors(nil, characteristic); err != nil {
-			return nil, fmt.Errorf("ble: couldn't fetch descriptors: %s", err)
+			return nil, true, fmt.Errorf("ble: couldn't fetch descriptors: %s", err)
 		}
 	}
 	if conn.txChar == nil || conn.rxChar == nil {
-		return nil, fmt.Errorf("ble: failed to find required characteristics")
+		return nil, true, fmt.Errorf("ble: failed to find required characteristics")
 	}
 	if err := client.Subscribe(conn.rxChar, true, conn.rx); err != nil {
-		return nil, fmt.Errorf("ble: failed to subscribe to RX: %s", err)
+		return nil, true, fmt.Errorf("ble: failed to subscribe to RX: %s", err)
 	}
 	log.Info("Connected to vehicle BLE")
-	return &conn, nil
+	return &conn, false, nil
 }
