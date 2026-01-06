@@ -539,6 +539,26 @@ var commands = map[string]*Command{
 			return car.FlashLights(ctx)
 		},
 	},
+	"low-power-mode": {
+		help:             "Set low power mode to STATE ('on' or 'off')",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		args: []Argument{
+			{name: "STATE", help: "'on' or 'off'"},
+		},
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, args map[string]string) error {
+			var state bool
+			switch args["STATE"] {
+			case "on":
+				state = true
+			case "off":
+				state = false
+			default:
+				return fmt.Errorf("low power mode state must be 'on' or 'off'")
+			}
+			return car.SetLowPowerMode(ctx, state)
+		},
+	},
 	"charging-set-limit": {
 		help:             "Set charge limit to PERCENT",
 		requiresAuth:     true,
@@ -623,6 +643,55 @@ var commands = map[string]*Command{
 				return fmt.Errorf("failed to parse volume")
 			}
 			return car.SetVolume(ctx, float32(volume))
+		},
+	},
+	"media-volume-up": {
+		help:             "Increase volume",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.VolumeUp(ctx)
+		},
+	},
+	"media-volume-down": {
+		help:             "Decrease volume",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.VolumeDown(ctx)
+		},
+	},
+	"media-next-favorite": {
+		help:             "Next favorite",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.MediaNextFavorite(ctx)
+		},
+	},
+	"media-next-track": {
+		help:             "Next track",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.MediaNextTrack(ctx)
+		},
+	},
+	"media-previous-track": {
+		help:             "Previous track",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.MediaPreviousTrack(ctx)
+		},
+	},
+
+	"media-previous-favorite": {
+		help:             "Previous favorite",
+		requiresAuth:     true,
+		requiresFleetAPI: false,
+		handler: func(ctx context.Context, _ *account.Account, car *vehicle.Vehicle, _ map[string]string) error {
+			return car.MediaPreviousFavorite(ctx)
 		},
 	},
 	"media-toggle-playback": {
